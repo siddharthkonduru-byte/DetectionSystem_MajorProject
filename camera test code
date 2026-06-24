@@ -1,0 +1,187 @@
+import cv2
+import time
+from ultralytics import YOLO
+import winsound   # sound (PC)
+
+# -----------------------------
+# GPIO SAFE IMPORT (PC + PI)
+# -----------------------------
+try:
+    import RPi.GPIO as GPIO
+    PI_MODE = True
+except ImportError:
+    PI_MODE = False
+
+# -----------------------------
+# INITIAL SETUP
+# -----------------------------
+
+model = YOLO("yolov8n.pt")
+cap = cv2.VideoCapture(0)
+
+REAL_WIDTH = 0.3
+FOCAL_LENGTH = 1000
+
+MIN_RANGE = 1
+MAX_RANGE = 2
+
+stable_count = 0
+prev_time = time.time()
+
+last_fire_time = 0
+cooldown = 3
+
+# -----------------------------
+# GPIO SETUP (ONLY PI)
+# -----------------------------
+if PI_MODE:
+    GPIO.setmode(GPIO.BCM)
+    TRIGGER_PIN = 18
+    GPIO.setup(TRIGGER_PIN, GPIO.OUT)
+    GPIO.output(TRIGGER_PIN, GPIO.LOW)
+
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.resize(frame, (640, 480))
+
+    h, w, _ = frame.shape
+    frame_center_x = w // 2
+
+    # Center line
+    cv2.line(frame, (frame_center_x, 0), (frame_center_x, h), (255,0,0), 2)
+
+    results = model(frame, verbose=False)
+
+    target_detected = False
+
+    for r in results:
+        if len(r.boxes) == 0:
+            continue
+
+        best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
+
+        conf = float(best_box.conf[0])
+        if conf < 0.5:
+            continue
+
+        cls = int(best_box.cls[0])
+        label = model.names[cls]
+
+        if label != "person":
+            continue
+
+        x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        pixel_width = x2 - x1
+
+        if pixel_width < 50:
+            continue
+
+        distance = (REAL_WIDTH * FOCAL_LENGTH) / pixel_width
+
+        # Draw box
+        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+        cv2.circle(frame, (cx, cy), 5, (0,0,255), -1)
+
+        cv2.putText(frame, f"UAV {distance:.2f} m",
+                    (x1, y1-20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255,255,255), 2)
+
+        target_detected = True
+
+        # -----------------------------
+        # RANGE STATUS
+        # -----------------------------
+        if distance < MIN_RANGE:
+            status = "TOO CLOSE"
+            color = (0,0,255)
+        elif distance > MAX_RANGE:
+            status = "TOO FAR"
+            color = (0,0,255)
+        else:
+            status = "IN RANGE"
+            color = (0,255,0)
+
+        cv2.putText(frame, status,
+                    (x1, y2 + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, color, 2)
+
+        # -----------------------------
+        # TARGET LOCK LOGIC
+        # -----------------------------
+        center_offset = abs(cx - frame_center_x)
+
+        if MIN_RANGE <= distance <= MAX_RANGE and center_offset < 50:
+            stable_count += 1
+        else:
+            stable_count = 0
+
+        # -----------------------------
+        # SHOW LOCK (ALWAYS WHEN LOCKED)
+        # -----------------------------
+        if stable_count > 5:
+            cv2.rectangle(frame, (40, 30), (300, 80), (0,0,255), 2)
+            cv2.putText(frame, "TARGET LOCKED",
+                        (50, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0,0,255), 2)
+
+        # -----------------------------
+        # FIRE LOGIC (SEPARATE)
+        # -----------------------------
+        current_time = time.time()
+
+        if stable_count > 3 and (current_time - last_fire_time > cooldown):
+
+            print("FIRE 🔥")
+            winsound.Beep(1000, 300)
+
+            if PI_MODE:
+                GPIO.output(TRIGGER_PIN, GPIO.HIGH)
+                time.sleep(1)
+                GPIO.output(TRIGGER_PIN, GPIO.LOW)
+            else:
+                print("Trigger simulated (PC mode)")
+
+            last_fire_time = current_time
+            stable_count = 0
+
+    if not target_detected:
+        stable_count = 0
+
+    # -----------------------------
+    # FPS
+    # -----------------------------
+    curr_time = time.time()
+    fps = 1 / (curr_time - prev_time)
+    prev_time = curr_time
+
+    cv2.putText(frame, f"FPS: {int(fps)}",
+                (10,30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (0,255,255), 2)
+
+    cv2.imshow("UAV Detection System", frame)
+
+    if cv2.waitKey(1) == 27:
+        break
+
+# -----------------------------
+# CLEANUP
+# -----------------------------
+cap.release()
+cv2.destroyAllWindows()
+
+if PI_MODE:
+    GPIO.cleanup()
